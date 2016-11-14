@@ -45,6 +45,7 @@ public class LoginPrompter extends Placeholder {
         this.login = new Button(OTNBundle.getString("OTN.BUTTON.LOGIN"));
         this.login.getStyleClass().add("login");
         this.login.setOnAction(e -> {
+            System.out.println("[JVDBG] LOGIN PROMPTER, setOnAction");
             if (service.authenticate()) {
                 onAuthenticated.run();
             }

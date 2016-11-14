@@ -26,9 +26,18 @@
 package com.gluonhq.otn.model;
 
 import com.gluonhq.charm.glisten.afterburner.GluonView;
+import com.gluonhq.connect.ConnectState;
+import com.gluonhq.connect.GluonObservableList;
 import com.gluonhq.connect.GluonObservableObject;
+import com.gluonhq.connect.gluoncloud.AuthenticationMode;
+import com.gluonhq.connect.gluoncloud.GluonClient;
+import com.gluonhq.connect.gluoncloud.GluonClientBuilder;
+import com.gluonhq.connect.gluoncloud.GluonCredentials;
+import com.gluonhq.connect.gluoncloud.OperationMode;
 import com.gluonhq.connect.provider.DataProvider;
 import com.gluonhq.connect.provider.RestClient;
+import java.util.ArrayList;
+import java.util.List;
 import javafx.beans.property.ReadOnlyListProperty;
 import javafx.beans.property.ReadOnlyListWrapper;
 import javafx.beans.property.ReadOnlyObjectProperty;
@@ -36,6 +45,8 @@ import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 
 import java.util.logging.Logger;
+import javafx.beans.InvalidationListener;
+import javafx.collections.ListChangeListener;
 
 public class DevoxxService extends BaseService {
 
@@ -45,10 +56,26 @@ public class DevoxxService extends BaseService {
 
     private ReadOnlyListWrapper<Session> sessions;
     private ReadOnlyListWrapper<Speaker> speakers;
+    private final GluonClient localGluonClient;
+    private final GluonClient cloudGluonClient;
 
     public DevoxxService() {
         sessions = new ReadOnlyListWrapper<>(retrieveSessionsInternal());
         speakers = new ReadOnlyListWrapper<>(retrieveSpeakersInternal());
+        GluonCredentials gluonCredentials = new GluonCredentials("XXXXXXXXXXXXXX", "YYYYYYYYYYYYYY");//see https://gluonhq.com/products/cloudlink
+
+        localGluonClient = GluonClientBuilder.create()
+                .credentials(gluonCredentials)
+                .authenticationMode(AuthenticationMode.PUBLIC)
+                .operationMode(OperationMode.LOCAL_ONLY)
+                .build();
+
+        cloudGluonClient = GluonClientBuilder.create()
+                //                .host(GLUONCLOUD_HOST)
+                .credentials(gluonCredentials)
+                .authenticationMode(AuthenticationMode.PUBLIC)
+                .operationMode(OperationMode.CLOUD_FIRST)
+                .build();
     }
 
     @Override
@@ -69,7 +96,7 @@ public class DevoxxService extends BaseService {
                 .path("/schedules/");
         GluonObservableObject<Schedules> linkOfSessions = DataProvider.retrieveObject(restClient.createObjectDataReader(Schedules.class));
         linkOfSessions.addListener((observable, oldValue, newValue) -> {
-            if(newValue != null) {
+            if (newValue != null) {
                 for (Link link : newValue.getLinks()) {
                     if (link.getHref() != null || !link.getHref().isEmpty()) {
                         fillAllSessionsOfDay(sessions, link);
@@ -82,10 +109,14 @@ public class DevoxxService extends BaseService {
     }
 
     /**
-     * Retrieve all sessions for a specific day, and add them to the list of all sessions.
-     * Adding sessions happens on the FX App thread, so no concurrency issues are expected.
-     * @param allSessions the list of all sessions from all days, passed by the caller.
-     * @param link a link containing info about the URL for retrieving the sessions for a specific day
+     * Retrieve all sessions for a specific day, and add them to the list of all
+     * sessions. Adding sessions happens on the FX App thread, so no concurrency
+     * issues are expected.
+     *
+     * @param allSessions the list of all sessions from all days, passed by the
+     * caller.
+     * @param link a link containing info about the URL for retrieving the
+     * sessions for a specific day
      */
     private void fillAllSessionsOfDay(ObservableList<Session> allSessions, Link link) {
         String day = link.getHref().substring(link.getHref().lastIndexOf('/') + 1);
@@ -95,7 +126,7 @@ public class DevoxxService extends BaseService {
                 .path("/schedules/" + day);
         GluonObservableObject<SchedulesOfDay> scheduleOfDay = DataProvider.retrieveObject(restClient.createObjectDataReader(SchedulesOfDay.class));
         scheduleOfDay.addListener((observable, oldValue, newValue) -> {
-            if(newValue != null) {
+            if (newValue != null) {
                 for (Session session : newValue.getSlots()) {
                     if (session.getTalk() != null) {
                         allSessions.add(session);
@@ -143,7 +174,95 @@ public class DevoxxService extends BaseService {
 
     @Override
     public ObservableList<Session> internalRetrieveScheduledSessions(Runnable onStateSucceeded) {
-        return null;
+        return internalRetrieveSessions("scheduled_sessions", onStateSucceeded);
+    }
+
+    private ObservableList<Session> internalRetrieveSessions(String listIdentifierSuffix, Runnable onStateSucceeded) {
+        ObservableList<Session> internalSessions = FXCollections.observableArrayList();
+        GluonObservableList<String> internalSessionsLocal = DataProvider.retrieveList(localGluonClient.createListDataReader(getAuthenticatedUserId() + "_" + listIdentifierSuffix, String.class));
+        internalSessionsLocal.initializedProperty().addListener((obsLocal, ovLocal, nvLocal) -> {
+            if (nvLocal) {
+                GluonObservableList<String> internalSessionsCloud = DataProvider.retrieveList(cloudGluonClient.createListDataReader(getAuthenticatedUserId() + "_" + listIdentifierSuffix, String.class));
+
+                // keep reference to the list of sessions that were added while loading the internal list
+                // the most likely use case is when a user is not yet logged in and clicks the favorite or
+                // schedule button to add a session
+                List<String> addedSessionBeforeInitialized = new ArrayList<>();
+                for (Session session : internalSessions) {
+                    addedSessionBeforeInitialized.add(session.getUuid());
+                }
+
+                for (String uuidLocal : internalSessionsLocal) {
+                    findSession(uuidLocal).ifPresent(internalSessions::add);
+                }
+
+                internalSessions.addListener(new ListChangeListener<Session>() {
+                    @Override
+                    public void onChanged(ListChangeListener.Change<? extends Session> c) {
+                        while (c.next()) {
+                            if (c.wasRemoved()) {
+                                for (Session session : c.getRemoved()) {
+                                    internalSessionsLocal.remove(session.getUuid());
+                                    internalSessionsCloud.remove(session.getUuid());
+                                }
+                            }
+                            if (c.wasAdded()) {
+                                for (Session session : c.getAddedSubList()) {
+                                    internalSessionsLocal.add(session.getUuid());
+                                    internalSessionsCloud.add(session.getUuid());
+                                }
+                            }
+                        }
+                    }
+                });
+
+                if (onStateSucceeded != null) {
+                    internalSessionsCloud.stateProperty().addListener(new InvalidationListener() {
+                        @Override
+                        public void invalidated(javafx.beans.Observable observable) {
+                            if (internalSessionsCloud.getState().equals(ConnectState.SUCCEEDED)) {
+                                internalSessionsCloud.stateProperty().removeListener(this);
+                                onStateSucceeded.run();
+                            }
+                        }
+                    });
+                }
+
+                internalSessionsCloud.initializedProperty().addListener((obsCloud, ovCloud, nvCloud) -> {
+                    if (nvCloud) {
+                        // add sessions to the local list that exist in cloudlink but not locally
+                        List<Session> cloudSessionsToAdd = new ArrayList<>();
+                        for (String uuidCloud : internalSessionsCloud) {
+                            if (!internalSessionsLocal.contains(uuidCloud)) {
+                                findSession(uuidCloud).ifPresent(cloudSessionsToAdd::add);
+                            }
+                        }
+                        internalSessions.addAll(cloudSessionsToAdd);
+
+                        // remove sessions from the local list that exist locally but not in cloudlink
+                        List<Session> localSessionsToRemove = new ArrayList<>();
+                        for (String uuidLocal : internalSessionsLocal) {
+                            if (!internalSessionsCloud.contains(uuidLocal)) {
+                                findSession(uuidLocal).ifPresent(localSessionsToRemove::add);
+                            }
+                        }
+                        internalSessions.removeAll(localSessionsToRemove);
+
+                        // add the sessions that were added before initialization was complete to the local
+                        // and cloud lists
+                        for (String uuidSession : addedSessionBeforeInitialized) {
+                            if (!internalSessionsLocal.contains(uuidSession)) {
+                                internalSessionsLocal.add(uuidSession);
+                            }
+                            if (!internalSessionsCloud.contains(uuidSession)) {
+                                internalSessionsCloud.add(uuidSession);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        return internalSessions;
     }
 
     @Override
@@ -163,7 +282,6 @@ public class DevoxxService extends BaseService {
 
     @Override
     public void retrieveSurveyAnswers() {
-        throw new UnsupportedOperationException("Not supported yet."); //To change body of generated methods, choose Tools | Templates.
     }
 
     @Override
